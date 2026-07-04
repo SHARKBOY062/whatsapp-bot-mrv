@@ -35,13 +35,14 @@ async def receive_webhook(request: Request):
             return Response(status_code=403)
 
     body = await request.json()
-    logger.info("Webhook recebido: event=%s | body=%s", body.get("event"), body)
 
-    event = body.get("event") or ""
-    if "messages.upsert" not in event and "message" not in event.lower():
+    # APIBrasil não coloca campo `event` — detectamos mensagem de texto pela
+    # presença de `data.key` + `data.message` (não lista, não presence update).
+    data = body.get("data")
+    if not (isinstance(data, dict) and data.get("key") and data.get("message")):
         return {"status": "ignored"}
 
-    parsed = _parse_message(body.get("data") or {})
+    parsed = _parse_message(data)
     if parsed is None:
         return {"status": "ignored"}
 
