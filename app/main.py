@@ -1,5 +1,13 @@
-"""Webhook FastAPI: recebe mensagens da APIBrasil, responde via Claude."""
+"""Webhook FastAPI: recebe mensagens da APIBrasil, responde via Groq (Llama).
 
+Comportamentos especiais:
+- Primeira interação: pequeno atraso (8s) pra dar tempo da mensagem de saudação
+  do WhatsApp Business chegar antes do bot entrar em cena.
+- Follow-up: endpoint `/check-stale` (chamado por GitHub Actions) envia
+  mensagem de re-engajamento pra leads silenciosos há 30+ minutos.
+"""
+
+import asyncio
 import logging
 
 from fastapi import FastAPI, Request, Response
@@ -16,6 +24,21 @@ AUDIO_FALLBACK_REPLY = (
     "Desculpa, ainda não consigo entender áudio 🙏 "
     "Pode digitar a sua pergunta que eu te respondo aqui na hora?"
 )
+
+FOLLOW_UP_MESSAGE = (
+    "Oi! Vi que ficou por aqui — você conseguiu instalar o app da MRV? "
+    "Se estiver com alguma dificuldade ou dúvida, é só me responder que "
+    "eu te ajudo. Se preferir, posso agendar uma ligação rapidinha com "
+    "nosso time pra destravar 😊"
+)
+
+# Tempo (segundos) que o bot espera antes de responder a PRIMEIRA mensagem
+# de um lead novo — dá margem pra saudação automática do WhatsApp Business
+# chegar primeiro (o link do app).
+GREETING_DELAY_SECONDS = 8
+
+# Silêncio (minutos) do lead antes de disparar o follow-up
+STALE_MINUTES = 30
 
 
 @app.get("/")
@@ -36,8 +59,7 @@ async def receive_webhook(request: Request):
 
     body = await request.json()
 
-    # APIBrasil não coloca campo `event` — detectamos mensagem de texto pela
-    # presença de `data.key` + `data.message` (não lista, não presence update).
+    # APIBrasil não coloca campo `event`; detectamos mensagem via data.key + data.message
     data = body.get("data")
     if not (isinstance(data, dict) and data.get("key") and data.get("message")):
         return {"status": "ignored"}
@@ -49,7 +71,6 @@ async def receive_webhook(request: Request):
     phone, kind, user_text = parsed
 
     if kind == "audio":
-        # Salva evento no histórico e responde pedindo texto
         memory.save_message(phone, "user", "[áudio recebido]")
         memory.save_message(phone, "assistant", AUDIO_FALLBACK_REPLY)
         whatsapp.send_text(phone, AUDIO_FALLBACK_REPLY)
@@ -57,16 +78,50 @@ async def receive_webhook(request: Request):
 
     logger.info("Mensagem de %s: %s", phone, user_text)
 
+    # Primeira interação com esse lead? Espera a saudação do WhatsApp Business
+    # (o link do app) chegar antes de responder.
+    is_first_interaction = memory.count_messages(phone) == 0
     memory.save_message(phone, "user", user_text)
-    history = memory.get_history(phone, MAX_HISTORY_MESSAGES)
 
-    reply = ai.generate_reply(history, user_text)
-    if not reply:
-        reply = "Deu um probleminha aqui. Pode tentar de novo daqui a pouquinho?"
+    if is_first_interaction:
+        logger.info("Primeira interação de %s — aguardando %ds pela saudação", phone, GREETING_DELAY_SECONDS)
+        await asyncio.sleep(GREETING_DELAY_SECONDS)
+
+    history = memory.get_history(phone, MAX_HISTORY_MESSAGES)
+    reply = ai.generate_reply(history[:-1], user_text) or (
+        "Deu um probleminha aqui. Pode tentar de novo daqui a pouquinho?"
+    )
 
     memory.save_message(phone, "assistant", reply)
     whatsapp.send_text(phone, reply)
     return {"status": "ok"}
+
+
+@app.post("/check-stale")
+async def check_stale(request: Request):
+    """Roda periodicamente (via GitHub Actions). Envia follow-up para leads
+    silenciosos há mais de STALE_MINUTES minutos — uma vez só por conversa."""
+    if WEBHOOK_SECRET:
+        provided = (
+            request.headers.get("X-Webhook-Secret")
+            or request.query_params.get("token")
+        )
+        if provided != WEBHOOK_SECRET:
+            return Response(status_code=403)
+
+    stale = memory.get_stale_phones(STALE_MINUTES)
+    if not stale:
+        return {"followed_up": 0}
+
+    for phone in stale:
+        try:
+            whatsapp.send_text(phone, FOLLOW_UP_MESSAGE)
+            memory.save_message(phone, "assistant", FOLLOW_UP_MESSAGE, is_follow_up=True)
+            logger.info("Follow-up enviado para %s", phone)
+        except Exception as exc:
+            logger.exception("Falha no follow-up para %s: %s", phone, exc)
+
+    return {"followed_up": len(stale)}
 
 
 def _parse_message(data: dict) -> tuple[str, str, str] | None:
