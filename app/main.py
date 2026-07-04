@@ -32,10 +32,10 @@ FOLLOW_UP_MESSAGE = (
     "nosso time pra destravar 😊"
 )
 
-# Tempo (segundos) que o bot espera antes de responder a PRIMEIRA mensagem
-# de um lead novo — dá margem pra saudação automática do WhatsApp Business
-# chegar primeiro (o link do app).
-GREETING_DELAY_SECONDS = 8
+# Pequena pausa antes de responder — deixa a resposta parecer menos "bot"
+# (envio instantâneo entrega que é máquina). Também dá tempo pro lead
+# terminar de digitar se estiver mandando várias mensagens em sequência.
+GREETING_DELAY_SECONDS = 2
 
 # Silêncio (minutos) do lead antes de disparar o follow-up
 STALE_MINUTES = 30
@@ -78,14 +78,10 @@ async def receive_webhook(request: Request):
 
     logger.info("Mensagem de %s: %s", phone, user_text)
 
-    # Primeira interação com esse lead? Espera a saudação do WhatsApp Business
-    # (o link do app) chegar antes de responder.
-    is_first_interaction = memory.count_messages(phone) == 0
     memory.save_message(phone, "user", user_text)
 
-    if is_first_interaction:
-        logger.info("Primeira interação de %s — aguardando %ds pela saudação", phone, GREETING_DELAY_SECONDS)
-        await asyncio.sleep(GREETING_DELAY_SECONDS)
+    # Pequena pausa antes de responder pra não parecer bot instantâneo
+    await asyncio.sleep(GREETING_DELAY_SECONDS)
 
     history = memory.get_history(phone, MAX_HISTORY_MESSAGES)
     reply = ai.generate_reply(history[:-1], user_text) or (
