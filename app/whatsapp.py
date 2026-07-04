@@ -39,5 +39,13 @@ def send_text(to: str, body: str) -> None:
 
 
 def _normalize_phone(number: str) -> str:
+    """Baileys/APIBrasil rejeita celular BR com o '9' extra (13 dígitos).
+    Precisa mandar no formato antigo (12 dígitos, sem o 9 depois do DDD).
+    Ex: 5511971562034 (13 dig) -> 551171562034 (12 dig).
+    """
     number = number.split("@")[0]
-    return "".join(ch for ch in number if ch.isdigit())
+    digits = "".join(ch for ch in number if ch.isdigit())
+    # Celular brasileiro com 9: 55 + DDD(2) + 9 + 8 dígitos = 13 dígitos
+    if len(digits) == 13 and digits.startswith("55") and digits[4] == "9":
+        digits = digits[:4] + digits[5:]
+    return digits
