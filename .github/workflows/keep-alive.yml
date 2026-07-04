@@ -1,0 +1,24 @@
+name: Keep Render alive
+
+on:
+  schedule:
+    # Cada 10 minutos — evita o auto-sleep do Render Free tier (15 min)
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping health endpoint
+        run: |
+          for i in 1 2 3; do
+            if curl -fsS --max-time 30 https://whatsapp-bot-mrv.onrender.com/ ; then
+              echo "\nOK (tentativa $i)"
+              exit 0
+            fi
+            echo "Falhou tentativa $i, retentando em 15s..."
+            sleep 15
+          done
+          echo "3 tentativas falharam"
+          exit 1
