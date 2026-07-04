@@ -17,7 +17,7 @@ WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
 
 # Groq — Llama 3.3 (grátis, ~30 req/min)
 GROQ_API_KEY = os.environ["GROQ_API_KEY"]
-CHAT_MODEL = "llama-3.3-70b-versatile"
+CHAT_MODEL = "llama-3.1-8b-instant"
 
 # Base de conhecimento
 KNOWLEDGE_PATH = Path(__file__).resolve().parent.parent / "knowledge" / "produto.md"
