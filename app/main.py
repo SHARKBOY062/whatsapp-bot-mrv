@@ -1,14 +1,8 @@
-"""Webhook FastAPI: recebe mensagens da APIBrasil, responde via Groq (Llama).
-
-Comportamentos especiais:
-- Primeira interação: pequeno atraso (8s) pra dar tempo da mensagem de saudação
-  do WhatsApp Business chegar antes do bot entrar em cena.
-- Follow-up: endpoint `/check-stale` (chamado por GitHub Actions) envia
-  mensagem de re-engajamento pra leads silenciosos há 30+ minutos.
-"""
+"""Webhook FastAPI: recebe mensagens da APIBrasil, responde via Groq (Llama)."""
 
 import asyncio
 import logging
+import traceback
 
 from fastapi import FastAPI, Request, Response
 
@@ -32,12 +26,7 @@ FOLLOW_UP_MESSAGE = (
     "nosso time pra destravar 😊"
 )
 
-# Pequena pausa antes de responder — deixa a resposta parecer menos "bot"
-# (envio instantâneo entrega que é máquina). Também dá tempo pro lead
-# terminar de digitar se estiver mandando várias mensagens em sequência.
 GREETING_DELAY_SECONDS = 2
-
-# Silêncio (minutos) do lead antes de disparar o follow-up
 STALE_MINUTES = 30
 
 
@@ -48,55 +37,85 @@ def healthcheck():
 
 @app.post("/webhook")
 async def receive_webhook(request: Request):
-    if WEBHOOK_SECRET:
-        provided = (
-            request.headers.get("X-Webhook-Secret")
-            or request.query_params.get("token")
-        )
-        if provided != WEBHOOK_SECRET:
-            logger.warning("Webhook rejeitado — segredo inválido")
-            return Response(status_code=403)
+    """Sempre retorna 200 — se algo falhar internamente, log detalhado mas
+    não deixa a APIBrasil reentregar em loop."""
+    try:
+        if WEBHOOK_SECRET:
+            provided = (
+                request.headers.get("X-Webhook-Secret")
+                or request.query_params.get("token")
+            )
+            if provided != WEBHOOK_SECRET:
+                logger.warning("Webhook rejeitado — segredo inválido")
+                return Response(status_code=403)
 
-    body = await request.json()
+        body = await request.json()
+        data = body.get("data")
+        if not (isinstance(data, dict) and data.get("key") and data.get("message")):
+            return {"status": "ignored"}
 
-    # APIBrasil não coloca campo `event`; detectamos mensagem via data.key + data.message
-    data = body.get("data")
-    if not (isinstance(data, dict) and data.get("key") and data.get("message")):
-        return {"status": "ignored"}
+        parsed = _parse_message(data)
+        if parsed is None:
+            return {"status": "ignored"}
 
-    parsed = _parse_message(data)
-    if parsed is None:
-        return {"status": "ignored"}
+        phone, kind, user_text = parsed
 
-    phone, kind, user_text = parsed
+        # Áudio: resposta padrão e retorna
+        if kind == "audio":
+            try:
+                memory.save_message(phone, "user", "[áudio recebido]")
+                memory.save_message(phone, "assistant", AUDIO_FALLBACK_REPLY)
+                whatsapp.send_text(phone, AUDIO_FALLBACK_REPLY)
+            except Exception:
+                logger.exception("Erro processando áudio de %s", phone)
+            return {"status": "ok"}
 
-    if kind == "audio":
-        memory.save_message(phone, "user", "[áudio recebido]")
-        memory.save_message(phone, "assistant", AUDIO_FALLBACK_REPLY)
-        whatsapp.send_text(phone, AUDIO_FALLBACK_REPLY)
+        logger.info("Mensagem de %s: %s", phone, user_text)
+
+        # Salva msg do lead (etapa 1) — se falhar aqui, ignora
+        try:
+            memory.save_message(phone, "user", user_text)
+        except Exception:
+            logger.exception("Falha ao salvar mensagem do lead %s", phone)
+
+        # Pausa curta
+        await asyncio.sleep(GREETING_DELAY_SECONDS)
+
+        # Gera resposta (etapa 2) — se Groq falhar, log mas não crasha
+        try:
+            history = memory.get_history(phone, MAX_HISTORY_MESSAGES)
+            # get_history já inclui a msg atual (que acabou de ser salva);
+            # passa histórico até antes dela pro modelo:
+            reply = ai.generate_reply(history[:-1], user_text)
+        except Exception:
+            logger.exception("Falha ao gerar resposta pra %s", phone)
+            reply = "Deu um probleminha aqui. Pode me repetir daqui a pouquinho?"
+
+        if not reply:
+            reply = "Deu um probleminha aqui. Pode me repetir daqui a pouquinho?"
+
+        # Salva resposta (etapa 3)
+        try:
+            memory.save_message(phone, "assistant", reply)
+        except Exception:
+            logger.exception("Falha ao salvar resposta do bot pra %s", phone)
+
+        # Envia via WhatsApp (etapa 4) — se APIBrasil falhar, log
+        try:
+            whatsapp.send_text(phone, reply)
+        except Exception:
+            logger.exception("Falha ao enviar mensagem pra %s (msg='%s')", phone, reply[:80])
+
         return {"status": "ok"}
 
-    logger.info("Mensagem de %s: %s", phone, user_text)
-
-    memory.save_message(phone, "user", user_text)
-
-    # Pequena pausa antes de responder pra não parecer bot instantâneo
-    await asyncio.sleep(GREETING_DELAY_SECONDS)
-
-    history = memory.get_history(phone, MAX_HISTORY_MESSAGES)
-    reply = ai.generate_reply(history[:-1], user_text) or (
-        "Deu um probleminha aqui. Pode tentar de novo daqui a pouquinho?"
-    )
-
-    memory.save_message(phone, "assistant", reply)
-    whatsapp.send_text(phone, reply)
-    return {"status": "ok"}
+    except Exception:
+        # Blindagem final — nenhum erro leve devolve 500 pra APIBrasil
+        logger.error("ERRO NÃO TRATADO NO WEBHOOK:\n%s", traceback.format_exc())
+        return {"status": "error_logged"}
 
 
 @app.post("/check-stale")
 async def check_stale(request: Request):
-    """Roda periodicamente (via GitHub Actions). Envia follow-up para leads
-    silenciosos há mais de STALE_MINUTES minutos — uma vez só por conversa."""
     if WEBHOOK_SECRET:
         provided = (
             request.headers.get("X-Webhook-Secret")
@@ -105,19 +124,26 @@ async def check_stale(request: Request):
         if provided != WEBHOOK_SECRET:
             return Response(status_code=403)
 
-    stale = memory.get_stale_phones(STALE_MINUTES)
+    try:
+        stale = memory.get_stale_phones(STALE_MINUTES)
+    except Exception:
+        logger.exception("Falha ao consultar stale phones")
+        return {"followed_up": 0, "error": True}
+
     if not stale:
         return {"followed_up": 0}
 
+    sent = 0
     for phone in stale:
         try:
             whatsapp.send_text(phone, FOLLOW_UP_MESSAGE)
             memory.save_message(phone, "assistant", FOLLOW_UP_MESSAGE, is_follow_up=True)
             logger.info("Follow-up enviado para %s", phone)
-        except Exception as exc:
-            logger.exception("Falha no follow-up para %s: %s", phone, exc)
+            sent += 1
+        except Exception:
+            logger.exception("Falha no follow-up para %s", phone)
 
-    return {"followed_up": len(stale)}
+    return {"followed_up": sent}
 
 
 def _parse_message(data: dict) -> tuple[str, str, str] | None:
